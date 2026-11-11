@@ -1,0 +1,9 @@
+{
+  "name": "手势生存 Gesture Survivor",
+  "short_name": "手势生存",
+  "start_url": "./",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#14161b",
+  "theme_color": "#14161b"
+}

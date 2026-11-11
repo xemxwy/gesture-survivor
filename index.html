@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14161b">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<!-- build: v3 -->
+<meta name="screen-orientation" content="landscape">
+<meta name="x5-orientation" content="landscape">
+<link rel="manifest" href="./manifest.json">
+<title>手势生存 · 完整版</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #14161b; overflow: hidden;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #eceef2; }
+  #wrap { position: relative; width: 100%; height: 100%; display: flex;
+          align-items: center; justify-content: center; }
+  canvas { display: block; max-width: 100%; max-height: 100%; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    background: rgba(20,22,27,.96); text-align: center; padding: 24px; }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: 30px; letter-spacing: 2px; }
+  #overlay p { font-size: 13px; color: #7c828c; line-height: 1.7; max-width: 600px; }
+  .btn { padding: 13px 26px; border: 1px solid #464c58; border-radius: 8px;
+    background: #202329; color: #eceef2; font-size: 15px; cursor: pointer;
+    min-width: 280px; text-align: left; }
+  .btn:hover { border-color: #6da0ff; }
+  .btn b { display: block; font-size: 16px; margin-bottom: 3px; }
+  .btn span { font-size: 12px; color: #7c828c; }
+  #err { color: #f0a050; font-size: 13px; max-width: 600px; line-height: 1.6; }
+  /* 小提示条：只出现在顶部，3 秒后自动消失，永远不挡操作 */
+  #toast { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 99; background: rgba(20,22,27,.92); color: #eceef2;
+    border: 1px solid #3a404c; border-radius: 20px; padding: 9px 18px;
+    font-size: 13px; opacity: 0; pointer-events: none;
+    transition: opacity .3s; white-space: nowrap; }
+  #toast.show { opacity: 1; }
+
+  /* 横屏手机高度只有 360~400px：压缩间距、允许滚动，保证内容都看得到 */
+  #overlay { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  @media (max-height: 560px) {
+    #overlay { gap: 6px; padding: 8px 16px; justify-content: flex-start; }
+    #overlay h1 { font-size: 20px; letter-spacing: 0; }
+    #overlay p { font-size: 11px; line-height: 1.45; max-width: 92vw; }
+    .btn { padding: 7px 16px; min-width: 240px; }
+    .btn b { font-size: 13px; margin-bottom: 0; }
+    .btn span { font-size: 10px; }
+  }
+  @media (max-height: 420px) {
+    #overlay { gap: 4px; padding: 4px 12px; }
+    #overlay h1 { font-size: 17px; }
+    #overlay p { font-size: 10px; }
+    .btn { padding: 6px 14px; min-width: 210px; }
+    .btn b { font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+<div id="toast"></div>
+  <canvas id="game" width="960" height="700"></canvas>
+  <div id="overlay">
+    <h1>手势生存 · 完整版</h1>
+    <p>6 种武器 / 6 种敌人 / 经验升级 / 4 种被动。<br>
+       进入绿色目标环得分；动作方向会周期性反转（REVERSE）。<br>
+       <b>一定要把手抬到摄像头视野里</b>，否则识别不到。</p>
+    <button class="btn" id="s1"><b>开始 · 单角色</b><span>一个角色，你的手控制它</span></button>
+    <button class="btn" id="s2"><b>开始 · 双角色</b><span>两个角色，控制权每 20 秒交换</span></button>
+    <p id="err"></p>
+    <p style="font-size:12px">画面只在本地处理，不上传、不保存。<br><span id="buildTag" style="color:#6da0ff">—</span></p>
+  </div>
+</div>
+<script type="module">
+import { Game, WEAPONS, PASSIVES, C, W, H, HUD, PLAY_T, PLAY_B } from "./game.js";
+
+const PW = W, PH = PLAY_B - PLAY_T;
+const BUILD = "v10";   // 每次发布手动 +1，页脚和诊断行会显示
+
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const overlay = document.getElementById("overlay");
+const errEl = document.getElementById("err");
+const buildTagEl = document.getElementById("buildTag");
+if (buildTagEl) buildTagEl.textContent = BUILD + " · 完整版";
+
+const clamp = (v,a,b) => v < a ? a : (v > b ? b : v);
+const ROMAN = ["", "I", "II", "III", "IV", "V"];
+
+// ------------------------------------------------ MediaPipe
+let HandLandmarker = null, FilesetResolver = null, CDN_BASE = null;
+const LOCAL_BUNDLE = "./vendor/tasks-vision/vision_bundle.mjs";
+const MODEL_LOCAL = "./vendor/models/hand_landmarker.task";
+const MODEL_CDN = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const CDN_BASES = [
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14",
+  "https://fastly.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14",
+  "https://unpkg.com/@mediapipe/tasks-vision@0.10.14",
+];
+function wasmBase() {
+  return CDN_BASE === LOCAL_BUNDLE ? "./vendor/tasks-vision/wasm" : CDN_BASE + "/wasm";
+}
+// 本地模型存在就用本地（离线可用），否则退回 CDN
+async function pickModel() {
+  try {
+    const r = await fetch(MODEL_LOCAL, { method: "HEAD" });
+    if (r.ok) return MODEL_LOCAL;
+  } catch (e) { /* ignore */ }
+  return MODEL_CDN;
+}
+const CDN_LIST = [LOCAL_BUNDLE, ...CDN_BASES];
+async function loadLib() {
+  for (const base of CDN_LIST) {
+    try {
+      const m = await import(base);
+      HandLandmarker = m.HandLandmarker;
+      FilesetResolver = m.FilesetResolver;
+      CDN_BASE = base;
+      return base;
+    } catch (e) { console.warn("CDN failed", base, e); }
+  }
+  throw new Error("无法从任何 CDN 加载 MediaPipe");
+}
+
+let landmarker = null, video = null, lastVideoTime = -1, hand = null;
+const stat = { fps: 0, frames: 0, t0: performance.now(), model: "loading",
+               det: 0, raw: 0, lastErr: "" };
+let diagForced = false;
+
+async function initTracking() {
+  // 每一步都设超时：任何一步卡住都会报错，而不是永远停在「加载识别模型」
+  const fs = await withTimeout(
+    FilesetResolver.forVisionTasks(wasmBase()), 30000, "加载 WASM");
+
+  const make = (delegate, model) => HandLandmarker.createFromOptions(fs, {
+    baseOptions: { modelAssetPath: model, delegate },
+    runningMode: "VIDEO", numHands: 1,
+    minHandDetectionConfidence: 0.45, minTrackingConfidence: 0.3,
+  });
+
+  // 依次尝试：本地+GPU -> 本地+CPU -> CDN+CPU
+  // （GPU 在某些手机浏览器上会卡住，所以给它最短的超时）
+  // 依次尝试：本地+GPU -> 本地+CPU -> CDN+CPU
+  // GPU 在部分手机浏览器上会卡死（不是报错，是不返回），所以给它最短超时。
+  const plans = [
+    ["GPU", MODEL_LOCAL, 12000, "GPU 加速"],
+    ["CPU", MODEL_LOCAL, 35000, "CPU 模式"],
+    ["CPU", MODEL_CDN, 60000, "备用线路"],
+  ];
+  let lastErr = null;
+  for (let k = 0; k < plans.length; k++) {
+    const [delegate, model, ms, label] = plans[k];
+    errEl.textContent = `正在初始化识别模型…（${label}，最多等 ${ms / 1000} 秒）`;
+    try {
+      landmarker = await withTimeout(make(delegate, model), ms, label);
+      console.info("[gesture] 模型就绪:", delegate, model, "第", k + 1, "次尝试");
+      errEl.textContent = "";
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.warn("[gesture]", label, "失败:", e && e.message);
+      errEl.textContent = `${label} 没成功，正在换下一种方式…`;
+    }
+  }
+  throw lastErr || new Error("模型初始化失败");
+}
+
+async function initCamera() {
+  // 注意：不能让它游离在 DOM 之外 —— iOS Safari 对未挂载的 video 常常不出帧。
+  // 挂到页面上但做成 1x1 不可见，兼容性最稳。
+  video = document.createElement("video");
+  video.playsInline = true; video.muted = true; video.autoplay = true;
+  video.setAttribute("playsinline", "");
+  video.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;"
+                      + "opacity:0.001;pointer-events:none;z-index:-1;";
+  document.body.appendChild(video);
+  // 摄像头可能永远不返回（被占用 / 权限被忽略），加超时，别让页面卡死
+  const stream = await withTimeout(navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480 }, audio: false }), 15000, "请求摄像头");
+  video.srcObject = stream;
+  await withTimeout(video.play(), 10000, "启动摄像头");
+}
+
+function readHands(now) {
+  if (!landmarker || !video || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  stat.det++;
+  const res = landmarker.detectForVideo(video, now);
+  stat.raw = res && res.landmarks ? res.landmarks.length : 0;
+  if (res && res.landmarks && res.landmarks.length) {
+    const lm = res.landmarks[0];
+    const pts = lm.map(p => ({ x: 1 - p.x, y: p.y }));
+    const w0 = pts[0], w9 = pts[9];
+    hand = { pts, palm: { x: (w0.x + w9.x) / 2, y: (w0.y + w9.y) / 2 } };
+  } else {
+    hand = null;
+  }
+}
+
+// 手机：尽量锁横屏（Android Chrome 全屏后可用；iOS Safari 不支持，靠 CSS 提示）
+async function goLandscape() {
+  try {
+    if (document.documentElement.requestFullscreen) {
+      await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+    }
+  } catch (e) { /* 用户或浏览器不允许，忽略 */ }
+  try {
+    if (screen.orientation && screen.orientation.lock) {
+      await screen.orientation.lock("landscape");
+    }
+  } catch (e) { /* iOS 不支持，忽略 */ }
+}
+
+// 竖屏提示：闪一下就走，不挡住开始；点屏幕可立刻关掉
+// 打开时提示一次「横过来」，3.5 秒自动消失。不做任何方向检测。
+let rotTimer = null;
+function showToast(msg, ms) {
+  const el = document.getElementById("toast");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(rotTimer);
+  rotTimer = setTimeout(() => el.classList.remove("show"), ms || 3500);
+}
+function bindRotateHint() {
+  setTimeout(() => showToast("请把手机横过来 · 建议架起来，人退后 60~80cm", 3500), 500);
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label + " 超时（" + ms / 1000 + " 秒）")), ms)),
+  ]);
+}
+
+let pendingDual = null;
+// 调试：?early=1 模拟「资源还没加载完就点了开始」
+const _early = new URLSearchParams(location.search).get("early");
+if (_early) setTimeout(() => start(false), 300);
+
+// ------------------------------------------------ 游戏
+let G = null;
+
+
+function start(dual) {
+  overlay.classList.add("hidden");
+  goLandscape();
+  if (stat.model !== "ok" || !video) { pendingDual = dual; return; }
+  G = new Game(dual);
+}
+
+document.getElementById("s1").onclick = () => start(false);
+document.getElementById("s2").onclick = () => start(true);
+
+window.addEventListener("keydown", (e) => {
+  if (!G) return;
+  const k = e.key.toLowerCase();
+  if (k === "z" || e.code === "Space") {
+    if (G.prep > 0) { G.prep = 0; return; }
+    if (G.ctrlPrep > 0) { G.ctrlPrep = 0; return; }
+    G.recenter(hand);
+    return;
+  }
+  if (k === "h") { G.hintOn = !G.hintOn; return; }
+  if (k === "d") { diagForced = !diagForced; return; }
+  if (k === "r" && G.over) { G = new Game(G.dual); return; }
+  if (G.mode === "levelup" && G.levelup) {
+    if (k === "1") G.applyChoice(G.levelup.choices[0], G.levelup.owner || G.activePlayer());
+    if (k === "2") G.applyChoice(G.levelup.choices[1], G.levelup.owner || G.activePlayer());
+  }
+});
+
+cv.addEventListener("click", (ev) => {
+  if (!G || G.mode !== "levelup" || !G.levelup) return;
+  const r = cv.getBoundingClientRect();
+  const x = (ev.clientX - r.left) * (W / r.width);
+  const y = (ev.clientY - r.top) * (H / r.height);
+  for (let i = 0; i < 2; i++) {
+    const b = cardRect(i);
+    if (x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h) {
+      G.applyChoice(G.levelup.choices[i], G.levelup.owner || G.activePlayer());
+    }
+  }
+});
+
+function cardRect(i) {
+  const w = 340, h = 190, gap = 60;
+  const total = w * 2 + gap;
+  return { x: (W - total) / 2 + i * (w + gap), y: PLAY_T + PH * 0.34, w, h };
+}
+
+let loadingT0 = performance.now();
+function drawLoading() {
+  const s = ((performance.now() - loadingT0) / 1000).toFixed(0);
+  ctx.fillStyle = "#14161b"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = C.text; ctx.font = "bold 26px sans-serif";
+  ctx.fillText("正在准备…", W / 2, H / 2 - 44);
+  ctx.fillStyle = C.dim; ctx.font = "15px sans-serif";
+  ctx.fillText(errEl.textContent || "加载中", W / 2, H / 2);
+  ctx.fillText(`已等待 ${s}s · 首次需要下载约 17 MB 识别资源`, W / 2, H / 2 + 32);
+  ctx.fillText("如果超过 60 秒，请检查网络或刷新页面", W / 2, H / 2 + 58);
+  ctx.textAlign = "left";
+}
+
+// ------------------------------------------------ 绘制
+function draw() {
+  const g = G;
+  if (!g) { drawLoading(); return; }
+
+  if (video && video.readyState >= 2) {
+    ctx.save(); ctx.globalAlpha = 0.42; ctx.scale(-1, 1);
+    ctx.drawImage(video, -W, 0, W, H); ctx.restore();
+  }
+  ctx.fillStyle = "rgba(20,22,27,0.60)";
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  for (let x = 0; x <= W; x += 48) { ctx.beginPath(); ctx.moveTo(x, PLAY_T); ctx.lineTo(x, PLAY_B); ctx.stroke(); }
+  for (let y = PLAY_T; y <= H; y += 48) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  const act = g.activePlayer();
+  g.dual = g.dual; // no-op
+
+  // 目标环
+  if (g.target) {
+    const rr = 42 + 4 * Math.sin(g.t * 6);
+    ctx.strokeStyle = C.target; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(g.target.x, g.target.y, Math.max(8, rr), 0, 7); ctx.stroke();
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath(); ctx.arc(g.target.x, g.target.y, Math.max(4, rr - 10), 0, 7); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // 经验宝石
+  for (const gm of g.gems) {
+    ctx.fillStyle = C.xp;
+    ctx.beginPath(); ctx.arc(gm.x, gm.y, gm.r, 0, 7); ctx.fill();
+  }
+
+  // 光环
+  if (act.weapons.AURA) {
+    const lv = act.weapons.AURA, r = 92 + 19 * lv;
+    ctx.fillStyle = "rgba(120,200,224,0.07)";
+    ctx.beginPath(); ctx.arc(act.x, act.y, r, 0, 7); ctx.fill();
+    ctx.strokeStyle = "rgba(120,200,224,0.35)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(act.x, act.y, r, 0, 7); ctx.stroke();
+  }
+
+  // NOVA 波
+  for (const m of g.marks) {
+    const k = 1 - m.life / 0.35;
+    ctx.strokeStyle = m.col; ctx.globalAlpha = 1 - k; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(m.x, m.y, m.r * (0.4 + 0.6 * k), 0, 7); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // 敌人
+  for (const e of g.enemies) {
+    ctx.fillStyle = e.col;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = "#12141a"; ctx.lineWidth = 1.5; ctx.stroke();
+    if (e.kind === "boss") {
+      const f = Math.max(0, e.hp / e.maxHp);
+      ctx.fillStyle = "#301820"; ctx.fillRect(e.x - 30, e.y - e.r - 12, 60, 6);
+      ctx.fillStyle = C.boss; ctx.fillRect(e.x - 30, e.y - e.r - 12, 60 * f, 6);
+    }
+  }
+
+  // 子弹
+  for (const b of g.bullets) {
+    ctx.fillStyle = b.col;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill();
+  }
+  // 闪电
+  for (const bm of g.beams) {
+    ctx.strokeStyle = "#c8b6ff"; ctx.globalAlpha = Math.min(1, bm.life * 8); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(bm.x1, bm.y1); ctx.lineTo(bm.x2, bm.y2); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // 环绕球
+  if (act.weapons.ORB) {
+    const lv = act.weapons.ORB, n = lv + 1;
+    for (let i = 0; i < n; i++) {
+      const a = act.orbA + (Math.PI * 2 * i) / n;
+      ctx.fillStyle = C.orb;
+      ctx.beginPath(); ctx.arc(act.x + Math.cos(a) * 58, act.y + Math.sin(a) * 58, 9, 0, 7); ctx.fill();
+    }
+  }
+
+  // 粒子
+  if (g.particles) {
+    for (const p of g.particles) {
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.life * 2));
+      ctx.fillStyle = p.col;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  drawPlayer(g.p1, C.player, g, 0);
+  if (g.dual) drawPlayer(g.p2, C.player2, g, 1);
+
+  // 飘字
+  ctx.font = "bold 14px sans-serif";
+  for (const f of g.floats) {
+    ctx.globalAlpha = Math.min(1, f.life);
+    ctx.fillStyle = f.col;
+    ctx.fillText(f.txt, f.x - 22, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  drawHud(g, act);
+  drawHandPip();
+
+  if (g.mode === "levelup") drawLevelup(g);
+  else if (g.ctrlPrep > 0) drawCentre(`NOW CONTROLLING ${g.active ? "P2" : "P1"}`,
+      Math.ceil(g.ctrlPrep), g.active ? C.player2 : C.player,
+      "move your hand toward the other character");
+  else if (g.prep > 0) drawCentre("GET READY", Math.ceil(g.prep), C.good,
+      "move your hand to all corners so it can learn your range");
+  else if (g.over) drawEnd(g);
+
+  drawDiag();
+}
+
+function drawPlayer(p, col, g, idx) {
+  const R = 13;
+  const fx = Math.cos(p.face), fy = Math.sin(p.face);
+  const px = -fy, py = fx;
+  ctx.beginPath();
+  ctx.moveTo(p.x + fx * (R + 7), p.y + fy * (R + 7));
+  ctx.lineTo(p.x - fx * R * 0.75 + px * R, p.y - fy * R * 0.75 + py * R);
+  ctx.lineTo(p.x - fx * R * 0.75 - px * R, p.y - fy * R * 0.75 - py * R);
+  ctx.closePath();
+  ctx.fillStyle = col; ctx.fill();
+  ctx.strokeStyle = "#fbfbfb"; ctx.lineWidth = 2; ctx.stroke();
+
+  if (g.dual && g.active === idx) {
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, R + 15 + 2 * Math.sin(g.t * 5), 0, 7); ctx.stroke();
+    ctx.fillStyle = col; ctx.font = "bold 12px sans-serif";
+    ctx.fillText("YOU", p.x - 14, p.y - R - 22);
+  }
+  if (p.inv > 0) {
+    ctx.strokeStyle = "rgba(200,240,255,.9)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(p.x, p.y, R + 12, 0, 7); ctx.stroke();
+  }
+  if (g.hintOn && g.target && (!g.dual || g.active === idx)) {
+    let dx = g.target.x - p.x, dy = g.target.y - p.y;
+    const n = Math.hypot(dx, dy) || 1;
+    dx /= n; dy /= n;
+    if (g.reverse) { dx = -dx; dy = -dy; }
+    ctx.strokeStyle = C.target; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + dx * 42, p.y + dy * 42); ctx.stroke();
+    const ah = 8;
+    ctx.beginPath();
+    ctx.moveTo(p.x + dx * 42, p.y + dy * 42);
+    ctx.lineTo(p.x + dx * 42 - dy * ah - dx * ah, p.y + dy * 42 + dx * ah - dy * ah);
+    ctx.lineTo(p.x + dx * 42 + dy * ah - dx * ah, p.y + dy * 42 - dx * ah - dy * ah);
+    ctx.closePath(); ctx.fillStyle = C.target; ctx.fill();
+  }
+}
+
+function drawHud(g, act) {
+  ctx.fillStyle = "#20232b"; ctx.fillRect(0, 0, W, HUD);
+
+  // HP
+  const f = clamp(act.hp / act.maxHp, 0, 1);
+  ctx.fillStyle = "#30343c"; ctx.fillRect(14, 10, 210, 16);
+  ctx.fillStyle = f > 0.5 ? "#5ac86e" : (f > 0.25 ? "#46b4dc" : "#505aeb");
+  ctx.fillRect(14, 10, 210 * f, 16);
+  ctx.fillStyle = "#f5f5f5"; ctx.font = "bold 12px sans-serif";
+  ctx.fillText("HP " + Math.ceil(act.hp), 19, 22);
+
+  // XP
+  const xf = clamp(act.xp / act.need, 0, 1);
+  ctx.fillStyle = "#30343c"; ctx.fillRect(14, 30, 210, 7);
+  ctx.fillStyle = C.xp; ctx.fillRect(14, 30, 210 * xf, 7);
+  ctx.fillStyle = C.xp; ctx.font = "11px sans-serif";
+  ctx.fillText("LV " + act.level, 232, 37);
+
+  if (g.dual) {
+    const g2 = clamp(g.p2.hp / g.p2.maxHp, 0, 1);
+    ctx.fillStyle = "#30343c"; ctx.fillRect(240, 12, 90, 12);
+    ctx.fillStyle = C.player2; ctx.fillRect(240, 12, 90 * g2, 12);
+  }
+
+  // 时间 / 击杀 / 认知指标
+  const left = Math.max(0, 160 - g.t);
+  ctx.fillStyle = C.text; ctx.font = "bold 21px sans-serif";
+  ctx.fillText(left.toFixed(1) + "s", 400, 30);
+  ctx.font = "12px sans-serif"; ctx.fillStyle = C.dim;
+  ctx.fillText("KILL " + g.stats.kills, 520, 20);
+  ctx.fillText("HIT " + g.hits + "/" + g.spawned, 520, 36);
+  const avg = g.hitTimes.length
+    ? (g.hitTimes.reduce((a, b) => a + b, 0) / g.hitTimes.length).toFixed(1) : "0.0";
+  ctx.fillText("AVG " + avg + "s", 610, 20);
+  ctx.fillText("ERR " + g.switchErr, 610, 36);
+
+  // 武器槽
+  let wx = 700;
+  ctx.font = "11px sans-serif";
+  for (const k of Object.keys(act.weapons)) {
+    const nm = (WEAPONS[k] || {}).name || k;
+    const txt = nm + " " + (ROMAN[act.weapons[k]] || act.weapons[k]);
+    ctx.fillStyle = (WEAPONS[k] || {}).color || C.dim;
+    ctx.fillText(txt, wx, 22);
+    wx += ctx.measureText(txt).width + 10;
+    if (wx > 940) { wx = 700; }
+  }
+  for (const k of Object.keys(act.passives)) {
+    const nm = (PASSIVES[k] || {}).name || k;
+    ctx.fillStyle = "#8a90a0";
+    ctx.fillText(nm + " " + (ROMAN[act.passives[k]] || act.passives[k]), wx, 38);
+    wx += ctx.measureText(nm).width + 12;
+    if (wx > 940) break;
+  }
+
+  // 模式
+  const col = g.reverse ? C.warn : C.good;
+  ctx.fillStyle = col; ctx.font = "bold 17px sans-serif";
+  ctx.fillText(g.reverse ? "REVERSE" : "NORMAL", 16, PLAY_T + 30);
+  ctx.font = "12px sans-serif";
+  ctx.fillText(g.reverse ? "hand -> opposite" : "hand -> same", 16, PLAY_T + 48);
+  if (g.calibrating) {
+    ctx.fillStyle = C.target;
+    ctx.fillText("CALIBRATING - move your hand to all corners", 16, PLAY_T + 66);
+  }
+  if (g.warnSwitch) {
+    ctx.fillStyle = C.warn; ctx.font = "bold 13px sans-serif";
+    ctx.fillText("SWITCHING", 16, PLAY_T + 84);
+  }
+  if (g.dual) {
+    ctx.fillStyle = g.active ? C.player2 : C.player; ctx.font = "13px sans-serif";
+    ctx.fillText(`CTRL ${g.active ? "P2" : "P1"}  ${(20 - g.ctrlT).toFixed(1)}s`, 16, PLAY_T + 104);
+  }
+  if (g.lull > 0) {
+    ctx.fillStyle = C.good; ctx.font = "13px sans-serif";
+    ctx.fillText("BREATHER " + g.lull.toFixed(1) + "s", 16, PLAY_T + 124);
+  }
+
+  ctx.fillStyle = "#585c64"; ctx.font = "12px sans-serif";
+  ctx.fillText("Z recenter   SPACE skip   H hint   D diag", W - 340, H - 10);
+}
+
+function drawHandPip() {
+  const pw = 168, ph = 126;
+  const x0 = W - pw - 12, y0 = PLAY_B - ph - 44;
+  ctx.fillStyle = "#1a1c22"; ctx.fillRect(x0, y0, pw, ph);
+  ctx.strokeStyle = "#444a56"; ctx.lineWidth = 1; ctx.strokeRect(x0, y0, pw, ph);
+
+  const R = G ? G.reach : null;
+  if (R && R.cx !== null) {
+    const bx0 = x0 + clamp(R.cx - 0.16, 0, 1) * pw;
+    const bx1 = x0 + clamp(R.cx + 0.16, 0, 1) * pw;
+    const by0 = y0 + clamp(R.cy - 0.16, 0, 1) * ph;
+    const by1 = y0 + clamp(R.cy + 0.16, 0, 1) * ph;
+    ctx.strokeStyle = "#38586c"; ctx.strokeRect(bx0, by0, bx1 - bx0, by1 - by0);
+    ctx.fillStyle = "#50788c";
+    ctx.beginPath(); ctx.arc(x0 + R.cx * pw, y0 + R.cy * ph, 3, 0, 7); ctx.fill();
+  }
+
+  if (!hand) {
+    ctx.fillStyle = C.warn; ctx.font = "bold 14px sans-serif";
+    ctx.fillText("NO HAND", x0 + 42, y0 + ph / 2);
+    if (stat.det > 20 && stat.raw === 0) {
+      ctx.font = "10px sans-serif"; ctx.fillStyle = "#8a8f98";
+      ctx.fillText("raise your hand higher", x0 + 8, y0 + ph / 2 + 18);
+    }
+    return;
+  }
+  const EDGES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],
+    [10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+  ctx.strokeStyle = "#5ad2a0"; ctx.lineWidth = 1;
+  for (const [a, b] of EDGES) {
+    ctx.beginPath();
+    ctx.moveTo(x0 + hand.pts[a].x * pw, y0 + hand.pts[a].y * ph);
+    ctx.lineTo(x0 + hand.pts[b].x * pw, y0 + hand.pts[b].y * ph);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#f0f8ff";
+  for (const p of hand.pts) { ctx.beginPath(); ctx.arc(x0 + p.x * pw, y0 + p.y * ph, 2, 0, 7); ctx.fill(); }
+  ctx.fillStyle = "#fff0a0";
+  ctx.beginPath(); ctx.arc(x0 + hand.palm.x * pw, y0 + hand.palm.y * ph, 5, 0, 7); ctx.fill();
+  ctx.fillStyle = C.good; ctx.font = "11px sans-serif";
+  ctx.fillText("hand ok", x0 + 5, y0 + 13);
+}
+
+function cardInfo(c, p) {
+  if (c.kind === "weapon") {
+    const w = WEAPONS[c.key], lv = p.weapons[c.key] || 0;
+    return { title: `${w.name} ${ROMAN[Math.min(5, lv + 1)]}`, desc: w.desc + `  (Lv ${lv} -> ${lv + 1})`, col: w.color };
+  }
+  if (c.kind === "new") {
+    const w = WEAPONS[c.key];
+    return { title: `NEW  ${w.name}`, desc: w.desc, col: w.color };
+  }
+  const pv = PASSIVES[c.key];
+  const lv = p.passives[c.key] || 0;
+  return { title: `${pv.name} ${ROMAN[Math.min(5, lv + 1)]}`, desc: pv.desc + `  (Lv ${lv} -> ${lv + 1})`, col: "#c8c8d0" };
+}
+
+function drawLevelup(g) {
+  const lu = g.levelup;
+  if (!lu) return;
+  ctx.fillStyle = "rgba(14,16,20,0.88)"; ctx.fillRect(0, PLAY_T, W, H - PLAY_T);
+  ctx.textAlign = "center";
+  ctx.fillStyle = C.good; ctx.font = "bold 26px sans-serif";
+  ctx.fillText("LEVEL UP", W / 2, PLAY_T + 70);
+  ctx.fillStyle = C.dim; ctx.font = "13px sans-serif";
+  ctx.fillText("push your hand to one side and hold - the bar must fill up", W / 2, PLAY_T + 98);
+  ctx.textAlign = "left";
+
+  const act = g.activePlayer();
+  for (let i = 0; i < 2; i++) {
+    const c = lu.choices[i];
+    if (!c) continue;
+    const b = cardRect(i);
+    const info = cardInfo(c, act);
+    const picked = (lu.side === -1 && i === 0) || (lu.side === 1 && i === 1);
+    ctx.fillStyle = picked ? "#2a3140" : "#20242c";
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeStyle = picked ? info.col : "#3a404c";
+    ctx.lineWidth = picked ? 2 : 1;
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+
+    ctx.fillStyle = info.col; ctx.font = "bold 22px sans-serif";
+    ctx.fillText(info.title, b.x + 22, b.y + 52);
+    ctx.fillStyle = "#9aa0ac"; ctx.font = "13px sans-serif";
+    ctx.fillText(info.desc, b.x + 22, b.y + 84);
+
+    // 进度条
+    ctx.fillStyle = "#30343c"; ctx.fillRect(b.x + 22, b.y + b.h - 40, b.w - 44, 8);
+    const pr = picked ? clamp(lu.hold / 0.55, 0, 1) : 0;
+    ctx.fillStyle = info.col; ctx.fillRect(b.x + 22, b.y + b.h - 40, (b.w - 44) * pr, 8);
+    if (picked && lu.hold > 0) {
+      ctx.fillStyle = info.col; ctx.font = "bold 12px sans-serif";
+      ctx.fillText(`${lu.hold.toFixed(2)} / ${g.LEVELUP_HOLD.toFixed(2)}s`, b.x + 22, b.y + b.h - 52);
+    }
+    ctx.fillStyle = "#6a7078"; ctx.font = "11px sans-serif";
+    ctx.fillText(i === 0 ? "hold LEFT  (or press 1)" : "hold RIGHT  (or press 2)",
+                 b.x + 22, b.y + b.h - 48);
+  }
+}
+
+function drawCentre(title, num, col, hint) {
+  ctx.fillStyle = "rgba(14,16,20,0.90)"; ctx.fillRect(0, PLAY_T, W, H - PLAY_T);
+  ctx.textAlign = "center";
+  ctx.fillStyle = col; ctx.font = "bold 28px sans-serif";
+  ctx.fillText(title, W / 2, PLAY_T + PH / 2 - 70);
+  ctx.fillStyle = C.text; ctx.font = "bold 68px sans-serif";
+  ctx.fillText(String(num), W / 2, PLAY_T + PH / 2 + 26);
+  ctx.fillStyle = C.dim; ctx.font = "13px sans-serif";
+  ctx.fillText(hint, W / 2, PLAY_T + PH / 2 + 84);
+  ctx.fillText("space to skip", W / 2, PLAY_T + PH / 2 + 108);
+  ctx.textAlign = "left";
+}
+
+function drawEnd(g) {
+  ctx.fillStyle = "rgba(14,16,20,0.92)";
+  ctx.fillRect(0, PLAY_T + PH / 2 - 100, W, 200);
+  ctx.textAlign = "center";
+  ctx.fillStyle = g.won ? C.good : C.bad;
+  ctx.font = "bold 32px sans-serif";
+  ctx.fillText(g.won ? "SURVIVED" : "YOU DIED", W / 2, PLAY_T + PH / 2 - 30);
+  const avg = g.hitTimes.length
+    ? (g.hitTimes.reduce((a, b) => a + b, 0) / g.hitTimes.length).toFixed(1) : "0.0";
+  const act = g.activePlayer();
+  ctx.fillStyle = C.dim; ctx.font = "14px sans-serif";
+  ctx.fillText(`LV ${act.level}   KILL ${g.stats.kills}   target ${g.hits}/${g.spawned}   avg ${avg}s   err ${g.switchErr}`,
+               W / 2, PLAY_T + PH / 2 + 12);
+  ctx.fillText("press R to restart", W / 2, PLAY_T + PH / 2 + 44);
+  ctx.textAlign = "left";
+}
+
+function drawDiag() {
+  const camOk = video && video.readyState >= 2;
+  const noHand = stat.det > 60 && stat.raw === 0;
+  const failing = noHand || stat.model !== "ok";
+  if (!diagForced && !failing && (G && G.t > 8)) return;
+  const col = noHand ? C.warn : "#5c616a";
+  const bw = 600, bh = 54, bx = (W - bw) / 2, by = PLAY_T + 8;
+  ctx.fillStyle = "rgba(16,18,22,.86)"; ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.strokeRect(bx, by, bw, bh);
+  ctx.fillStyle = col; ctx.font = "bold 14px monospace";
+  ctx.fillText(`fps ${stat.fps.toFixed(0)}  hand ${hand ? "yes" : "no"}  det ${stat.det}  raw ${stat.raw}`,
+               bx + 14, by + 22);
+  ctx.font = "12px monospace"; ctx.fillStyle = "#5c616a";
+  ctx.fillText(`cam ${camOk ? "ok" : "no"} ${video ? video.videoWidth : 0}x${video ? video.videoHeight : 0}  model ${stat.model}  build ${BUILD}`,
+               bx + 14, by + 42);
+  if (noHand) {
+    ctx.fillStyle = C.warn; ctx.font = "bold 13px sans-serif";
+    ctx.fillText("camera ok but no hand found -> raise your hand into the frame",
+                 bx + 14, by + bh + 16);
+  }
+}
+
+// ------------------------------------------------ 循环
+let prev = performance.now();
+let fatal = null;
+window.addEventListener("error", (ev) => {
+  fatal = fatal || ("window: " + ev.message + " @ " + (ev.filename || "") + ":" + (ev.lineno || 0));
+});
+function drawFatal(msg) {
+  ctx.fillStyle = "#14161b"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#e05a5a"; ctx.font = "bold 20px sans-serif";
+  ctx.fillText("程序出错（把这个画面发给开发者）", 40, 90);
+  ctx.fillStyle = "#f0a050"; ctx.font = "13px monospace";
+  const rows = String(msg).split("\n");
+  rows.slice(0, 14).forEach((r, i) => ctx.fillText(r.slice(0, 110), 40, 130 + i * 20));
+  ctx.fillStyle = "#7c828c"; ctx.font = "13px sans-serif";
+  ctx.fillText("刷新页面可重试", 40, 130 + Math.min(rows.length, 14) * 20 + 24);
+}
+
+function loop(now) {
+  const dt = Math.min((now - prev) / 1000, 0.05);
+  prev = now;
+  stat.frames++;
+  if (now - stat.t0 > 500) { stat.fps = stat.frames * 1000 / (now - stat.t0); stat.frames = 0; stat.t0 = now; }
+  try { readHands(now); stat.lastErr = ""; }
+  catch (e) { stat.lastErr = String(e && e.message || e); fatal = fatal || ("detect: " + stat.lastErr); }
+  if (G) {
+    try { G.update(dt, hand); } catch (e) { fatal = "update: " + (e && e.stack ? e.stack : e); }
+    try { draw(); } catch (e) { fatal = "draw: " + (e && e.stack ? e.stack : e); }
+  }
+  if (fatal) drawFatal(fatal);
+  requestAnimationFrame(loop);
+}
+
+// ------------------------------------------------ 启动
+function fail(msg) {
+  stat.model = "fail";
+  errEl.textContent = msg;
+  overlay.classList.remove("hidden");
+  document.getElementById("s1").disabled = true;
+  document.getElementById("s2").disabled = true;
+}
+
+(async () => {
+  try {
+    errEl.textContent = "正在加载 MediaPipe 库…";
+    await loadLib();
+    errEl.textContent = "正在加载识别模型（首次约 10 MB）…";
+    await initTracking();
+    stat.model = "ok";
+    errEl.textContent = "正在请求摄像头…";
+    await initCamera();
+    errEl.textContent = "";
+    if (pendingDual !== null) { G = new Game(pendingDual); pendingDual = null; }
+    // 调试/演示：?auto=1 直接单角色开局，?auto=dual 双角色
+    const _auto = new URLSearchParams(location.search).get("auto");
+    if (_auto) start(_auto === "dual");
+  } catch (err) {
+    fail("启动失败：" + (err && err.message ? err.message : err) +
+      "　—　请允许摄像头权限，并通过 https 或 localhost 打开；首次加载需联网。");
+    return;
+  }
+})();
+
+// 立刻开始渲染：模型还没加载完也要显示进度，绝不能黑屏
+requestAnimationFrame(loop);
+bindRotateHint();
+</script>
+</body>
+</html>

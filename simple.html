@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14161b">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<!-- build: v3 -->
+<meta name="screen-orientation" content="landscape">
+<meta name="x5-orientation" content="landscape">
+<link rel="manifest" href="./manifest.json">
+<title>手势生存 · 认知训练</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; background: #14161b; overflow: hidden;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #eceef2;
+  }
+  #wrap { position: relative; width: 100%; height: 100%; display: flex;
+          align-items: center; justify-content: center; }
+  canvas { display: block; max-width: 100%; max-height: 100%; }
+
+  #overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    background: rgba(20, 22, 27, 0.96); text-align: center; padding: 24px;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: 30px; font-weight: 700; letter-spacing: 2px; }
+  #overlay p { font-size: 14px; color: #7c828c; line-height: 1.7; max-width: 560px; }
+  .btn {
+    padding: 14px 28px; border: 1px solid #464c58; border-radius: 8px;
+    background: #202329; color: #eceef2; font-size: 15px; cursor: pointer;
+    min-width: 260px; text-align: left;
+  }
+  .btn:hover { border-color: #6da0ff; }
+  .btn b { display: block; font-size: 16px; margin-bottom: 4px; }
+  .btn span { font-size: 12px; color: #7c828c; }
+  #err { color: #f0a050; font-size: 13px; max-width: 560px; line-height: 1.6; }
+  /* 小提示条：只出现在顶部，3 秒后自动消失，永远不挡操作 */
+  #toast { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 99; background: rgba(20,22,27,.92); color: #eceef2;
+    border: 1px solid #3a404c; border-radius: 20px; padding: 9px 18px;
+    font-size: 13px; opacity: 0; pointer-events: none;
+    transition: opacity .3s; white-space: nowrap; }
+  #toast.show { opacity: 1; }
+
+  /* 横屏手机高度只有 360~400px：压缩间距、允许滚动，保证内容都看得到 */
+  #overlay { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  @media (max-height: 560px) {
+    #overlay { gap: 6px; padding: 8px 16px; justify-content: flex-start; }
+    #overlay h1 { font-size: 20px; letter-spacing: 0; }
+    #overlay p { font-size: 11px; line-height: 1.45; max-width: 92vw; }
+    .btn { padding: 7px 16px; min-width: 240px; }
+    .btn b { font-size: 13px; margin-bottom: 0; }
+    .btn span { font-size: 10px; }
+  }
+  @media (max-height: 420px) {
+    #overlay { gap: 4px; padding: 4px 12px; }
+    #overlay h1 { font-size: 17px; }
+    #overlay p { font-size: 10px; }
+    .btn { padding: 6px 14px; min-width: 210px; }
+    .btn b { font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+<div id="toast"></div>
+  <canvas id="game" width="960" height="700"></canvas>
+
+  <div id="overlay">
+    <h1>手势生存</h1>
+    <p>用摄像头识别你的手，控制角色躲避敌人、进入绿色目标环。<br>
+       动作方向会周期性反转（REVERSE），那是训练的一部分。</p>
+    <button class="btn" id="startSingle"><b>开始 · 单角色</b><span>一个角色，你的手控制它</span></button>
+    <button class="btn" id="startDual"><b>开始 · 双角色</b><span>两个角色，控制权每 20 秒交换</span></button>
+    <p id="err"></p>
+    <p style="font-size:12px">画面只在本地处理，不上传、不保存。首次加载需要联网下载识别模型。</p>
+    <p style="font-size:13px"><a href="./" style="color:#6da0ff">→ 完整版（6 武器 / 6 敌人 / 经验升级 / 4 被动）</a></p>
+  </div>
+</div>
+
+<script type="module">
+// MediaPipe 库：静态 import 一旦失败，整个模块都不执行（按钮点了也没反应）。
+// 改成动态 import + 多个 CDN 依次尝试，失败也能把错误显示出来。
+let HandLandmarker = null, FilesetResolver = null, CDN_BASE = null;
+const LOCAL_BUNDLE = "./vendor/tasks-vision/vision_bundle.mjs";
+const MODEL_LOCAL = "./vendor/models/hand_landmarker.task";
+const MODEL_CDN = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const CDN_BASES = [
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14",
+  "https://fastly.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14",
+  "https://unpkg.com/@mediapipe/tasks-vision@0.10.14",
+];
+function wasmBase() {
+  return CDN_BASE === LOCAL_BUNDLE ? "./vendor/tasks-vision/wasm" : CDN_BASE + "/wasm";
+}
+// 本地模型存在就用本地（离线可用），否则退回 CDN
+async function pickModel() {
+  try {
+    const r = await fetch(MODEL_LOCAL, { method: "HEAD" });
+    if (r.ok) return MODEL_LOCAL;
+  } catch (e) { /* ignore */ }
+  return MODEL_CDN;
+}
+const CDN_LIST = [LOCAL_BUNDLE, ...CDN_BASES];
+
+async function loadLib() {
+  for (const base of CDN_LIST) {
+    try {
+      const m = await import(base);
+      HandLandmarker = m.HandLandmarker;
+      FilesetResolver = m.FilesetResolver;
+      CDN_BASE = base;
+      console.info("MediaPipe 已从", base, "加载");
+      return base;
+    } catch (e) {
+      console.warn("CDN 失败：", base, e);
+    }
+  }
+  throw new Error("无法从任何 CDN 加载 MediaPipe（网络受限？）");
+}
+
+// ---------------------------------------------------------------- 常量
+const W = 960, H = 700, HUD = 46;
+const PLAY_L = 0, PLAY_T = HUD, PLAY_R = W, PLAY_B = H;
+const PW = PLAY_R - PLAY_L, PH = PLAY_B - PLAY_T;
+
+const PLAYER_R = 13, PLAYER_SPEED = 300;
+const JOY_HALF = 0.16, JOY_DEAD = 0.06;
+const SURVIVE_SEC = 160;
+
+const FIRST_SWITCH = 15, SWITCH_EVERY = 12;
+const CTRL_SWITCH = 20, CTRL_PREP = 8;
+const TARGET_R = 42, TARGET_TIMEOUT = 12, TARGET_GAP = 5;
+
+// 贴身光环：不需要瞄准，靠近就持续掉血。
+// 这样「清怪」不占注意力，注意力留给目标环和反转规则（那才是训练目标）。
+const AURA_R = 96, AURA_DPS = 26, MAX_ENEMIES = 110;
+
+const HAND_EDGES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],[0,17]];
+
+const C = {
+  bg: "#14161b", grid: "#1e2129", text: "#eceef2", dim: "#7c828c",
+  good: "#6edc8c", warn: "#f0a050", player: "#fff6d6", player2: "#ffaa6e",
+  enemy: ["#5a82f0", "#46c8e6", "#be64dc", "#f08c5a"],
+  target: "#78ffc8", aura: "#78aaff",
+};
+
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const overlay = document.getElementById("overlay");
+const errEl = document.getElementById("err");
+
+// ---------------------------------------------------------------- 工具
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function joyAxis(v, center, half) {
+  half = Math.max(JOY_HALF, half || JOY_HALF);
+  let n = (v - center) / half;
+  n = clamp(n, -1, 1);
+  if (Math.abs(n) < JOY_DEAD) return 0;
+  const s = n > 0 ? 1 : -1;
+  return s * (Math.abs(n) - JOY_DEAD) / (1 - JOY_DEAD);
+}
+
+// ---------------------------------------------------------------- 手部
+let landmarker = null, video = null, lastVideoTime = -1;
+let hands = [];          // 当前帧的 [{pts, palm, openness}]
+
+async function initTracking() {
+  const fileset = await FilesetResolver.forVisionTasks(wasmBase());
+  const MODEL = await pickModel();
+  const make = (delegate) => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: MODEL,
+      delegate,
+    },
+    runningMode: "VIDEO",
+    numHands: 1,
+    minHandDetectionConfidence: 0.45,
+    minTrackingConfidence: 0.3,
+  });
+  try {
+    landmarker = await make("GPU");
+  } catch (e) {
+    console.warn("GPU delegate failed, fallback to CPU:", e);
+    landmarker = await make("CPU");
+  }
+}
+
+async function initCamera() {
+  video = document.createElement("video");
+  video.playsInline = true; video.muted = true; video.autoplay = true;
+  video.setAttribute("playsinline", "");
+  video.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1px;opacity:0.001;pointer-events:none;z-index:-1;";
+  document.body.appendChild(video);   // iOS Safari 需要 video 在 DOM 里才会解码
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 640, height: 480 }, audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+function readHands(now) {
+  if (!landmarker || !video || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  stat.det++;
+  const res = landmarker.detectForVideo(video, now);
+  stat.raw = res && res.landmarks ? res.landmarks.length : 0;
+  const out = [];
+  if (res && res.landmarks) {
+    for (const lm of res.landmarks) {
+      // 镜像：视频是镜像显示的，坐标也要跟着翻
+      const pts = lm.map(p => ({ x: 1 - p.x, y: p.y }));
+      const wrist = pts[0], midMcp = pts[9];
+      const palm = { x: (wrist.x + midMcp.x) / 2, y: (wrist.y + midMcp.y) / 2 };
+      const ratios = [[5,8],[9,12],[13,16],[17,20]].map(([m,t]) => {
+        const dm = dist(pts[m], wrist);
+        return dm > 1e-6 ? dist(pts[t], wrist) / dm : 0;
+      });
+      out.push({ pts, palm, openness: ratios.reduce((a,b)=>a+b,0)/ratios.length });
+    }
+  }
+  out.sort((a, b) => a.palm.x - b.palm.x);
+  hands = out;
+}
+
+// ---------------------------------------------------------------- 游戏状态
+let G = null;
+
+function newGame(dual) {
+  return {
+    t: 0, over: false, won: false,
+    // 玩家
+    p1: { x: PW * 0.35, y: PH * 0.55, hp: 120, face: -Math.PI/2, inv: 0, score: 0 },
+    p2: { x: PW * 0.72, y: PH * 0.45, hp: 120, face: -Math.PI/2, inv: 0, score: 0 },
+    dual: !!dual, active: 0,
+    // 摇杆
+    reach: { lo: null, hi: null, t0: null, cx: null, cy: null },
+    joy: { x: 0, y: 0 },
+    calibrating: true,
+    // 认知训练
+    reverse: false, nextSwitch: FIRST_SWITCH, warn: false,
+    target: null, targetGap: 0,
+    hits: 0, spawned: 0, hitTimes: [], switchErr: 0,
+    errWindow: false, errCounted: false, lastP: { x: PW*0.35, y: PH*0.55 },
+    // 控制权
+    ctrlT: 0, ctrlPrep: 0,
+    // 世界
+    enemies: [], particles: [], floats: [], kills: 0,
+    spawnT: 0, lull: 0, nextLull: 34,
+    prep: 8, hintOn: true, hintSec: 30,
+  };
+}
+
+function spawnEnemy(g) {
+  const k = g.t / SURVIVE_SEC;
+  const edge = Math.floor(Math.random() * 4);
+  let x, y;
+  if (edge === 0) { x = Math.random() * PW; y = -20; }
+  else if (edge === 1) { x = Math.random() * PW; y = PH + 20; }
+  else if (edge === 2) { x = -20; y = Math.random() * PH; }
+  else { x = PW + 20; y = Math.random() * PH; }
+  g.enemies.push({
+    x, y,
+    hp: (1 + 2.2 * k) * (0.8 + Math.random() * 0.6),
+    spd: 52 + 34 * k,
+    r: 10 + 3.5 * k,
+    col: C.enemy[Math.floor(Math.random() * C.enemy.length)],
+  });
+}
+
+function spawnTarget(g) {
+  const px = g.dual && g.active === 1 ? g.p2.x : g.p1.x;
+  const py = g.dual && g.active === 1 ? g.p2.y : g.p1.y;
+  for (let i = 0; i < 24; i++) {
+    const x = 70 + Math.random() * (PW - 140);
+    const y = 80 + Math.random() * (PH - 150);
+    if (Math.hypot(x - px, y - py) > 170) {
+      g.target = { x, y, born: g.t };
+      g.spawned++;
+      return;
+    }
+  }
+  g.target = { x: PW / 2, y: PH / 2, born: g.t };
+  g.spawned++;
+}
+
+// ---------------------------------------------------------------- 更新
+function update(g, dt) {
+  if (g.prep > 0) { g.prep = Math.max(0, g.prep - dt); g.calibrating = true; return; }
+  if (g.ctrlPrep > 0) { g.ctrlPrep = Math.max(0, g.ctrlPrep - dt); return; }
+  if (g.over) return;
+
+  g.t += dt;
+  g.p1.inv = Math.max(0, g.p1.inv - dt);
+  g.p2.inv = Math.max(0, g.p2.inv - dt);
+
+  // ---- 摇杆：把「当前手」映射成速朝 ----
+  const h = hands[0];
+  if (h) {
+    if (g.reach.lo === null) {
+      g.reach = { lo: h.palm.x, hi: h.palm.x, t0: g.t,
+                  cx: h.palm.x, cy: h.palm.y };
+    } else {
+      g.reach.lo = Math.min(g.reach.lo, h.palm.x);
+      g.reach.hi = Math.max(g.reach.hi, h.palm.x);
+      if (g.calibrating) {
+        g.reach.cx = (g.reach.lo + g.reach.hi) / 2;
+        g.reach.cy = h.palm.y;
+      }
+    }
+    if (g.reach.t0 !== null && g.t - g.reach.t0 > 8) g.calibrating = false;
+    let jx = joyAxis(h.palm.x, g.reach.cx, JOY_HALF);
+    let jy = joyAxis(h.palm.y, g.reach.cy, JOY_HALF);
+    if (g.reverse) { jx = -jx; jy = -jy; }
+    g.joy.x = jx; g.joy.y = jy;
+  } else {
+    g.joy.x = 0; g.joy.y = 0;
+  }
+
+  // ---- 移动（双角色只有一个能动）----
+  const mag = Math.min(1, Math.hypot(g.joy.x, g.joy.y));
+  if (mag > 1e-6) {
+    const ux = g.joy.x / mag, uy = g.joy.y / mag;
+    const sp = PLAYER_SPEED * Math.pow(mag, 0.6);
+    const who = g.dual && g.active === 1 ? g.p2 : g.p1;
+    who.face = Math.atan2(uy, ux);
+    who.x += ux * sp * dt;
+    who.y += uy * sp * dt;
+  }
+  for (const p of [g.p1, g.p2]) {
+    p.x = clamp(p.x, PLAYER_R, PW - PLAYER_R);
+    p.y = clamp(p.y, PLAYER_R, PH - PLAYER_R);
+  }
+
+  // ---- 控制权交换 ----
+  if (g.dual) {
+    g.ctrlT += dt;
+    if (g.ctrlT >= CTRL_SWITCH) {
+      g.ctrlT = 0; g.active = 1 - g.active; g.ctrlPrep = CTRL_PREP;
+    }
+  }
+
+  // ---- 反转映射 ----
+  if (g.t >= g.nextSwitch) {
+    g.reverse = !g.reverse;
+    g.nextSwitch += SWITCH_EVERY;
+    g.errWindow = true; g.errCounted = false;
+    g.floats.push({ x: g.p1.x, y: g.p1.y - 46, txt: g.reverse ? "REVERSE" : "NORMAL",
+                    life: 1.2, col: g.reverse ? C.warn : C.good });
+  }
+  g.warn = (g.nextSwitch - g.t) <= 1.5;
+
+  // ---- 目标环 ----
+  if (!g.target) {
+    if (g.targetGap > 0) g.targetGap = Math.max(0, g.targetGap - dt);
+    else spawnTarget(g);
+  } else {
+    const ps = [g.p1]; if (g.dual) ps.push(g.p2);
+    const hit = ps.some(p => Math.hypot(g.target.x - p.x, g.target.y - p.y)
+                             < TARGET_R + PLAYER_R);
+    if (hit) {
+      g.hits++;
+      g.hitTimes.push(g.t - g.target.born);
+      burst(g, g.target.x, g.target.y, C.target, 14, 200);
+      g.target = null; g.targetGap = TARGET_GAP;
+    } else if (g.t - g.target.born > TARGET_TIMEOUT) {
+      g.target = null; g.targetGap = TARGET_GAP;
+    }
+  }
+
+  // ---- 抑制失败：切换后 1.2 秒内朝反方向走 ----
+  const act = g.dual && g.active === 1 ? g.p2 : g.p1;
+  const dpx = act.x - g.lastP.x, dpy = act.y - g.lastP.y;
+  g.lastP = { x: act.x, y: act.y };
+  if (g.errWindow) {
+    if (g.t - (g.nextSwitch - SWITCH_EVERY) > 1.2) g.errWindow = false;
+    else if (!g.errCounted && g.target && dpx*dpx + dpy*dpy > 4) {
+      const tx = g.target.x - act.x, ty = g.target.y - act.y;
+      if (dpx * tx + dpy * ty < 0) { g.switchErr++; g.errCounted = true; }
+    }
+  }
+
+  // ---- 喘隙 ----
+  if (g.lull <= 0 && g.t >= g.nextLull) { g.lull = 6; g.nextLull += 34; }
+  g.lull = Math.max(0, g.lull - dt);
+
+  // ---- 刷怪 ----
+  const k = g.t / SURVIVE_SEC;
+  if (g.lull <= 0) {
+    g.spawnT -= dt;
+    if (g.spawnT <= 0 && g.enemies.length < MAX_ENEMIES) {
+      g.spawnT = Math.max(0.22, 0.58 - 0.30 * k);
+      spawnEnemy(g);
+      if (Math.random() < 0.55 + 0.45 * k) spawnEnemy(g);
+    }
+  }
+
+  // ---- 敌人 ----
+  for (const e of g.enemies) {
+    let target = g.p1, best = Infinity;
+    for (const p of [g.p1, g.p2]) {
+      if (!g.dual && p === g.p2) continue;
+      const d = Math.hypot(p.x - e.x, p.y - e.y);
+      if (d < best) { best = d; target = p; }
+    }
+    const dx = target.x - e.x, dy = target.y - e.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const slow = g.lull > 0 ? 0.45 : 1;
+    e.x += dx / d * e.spd * slow * dt;
+    e.y += dy / d * e.spd * slow * dt;
+    for (const p of [g.p1, g.p2]) {
+      if (!g.dual && p === g.p2) continue;
+      if (p.inv > 0) continue;
+      if (Math.hypot(p.x - e.x, p.y - e.y) < e.r + PLAYER_R) {
+        p.hp -= 5; p.inv = 0.9; burst(g, p.x, p.y, "#505af0", 10, 200);
+      }
+    }
+  }
+  // 简单分离：避免叠在一起
+  for (let i = 0; i < g.enemies.length; i++) {
+    for (let j = i + 1; j < g.enemies.length; j++) {
+      const a = g.enemies[i], b = g.enemies[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const min = a.r + b.r;
+      if (d < min) {
+        const push = (min - d) / 2;
+        a.x -= dx / d * push; a.y -= dy / d * push;
+        b.x += dx / d * push; b.y += dy / d * push;
+      }
+    }
+  }
+
+  // ---- 光环：贴身敌人持续掉血，死后立刻移除 ----
+  const auraP = g.dual && g.active === 1 ? g.p2 : g.p1;
+  const auraR = AURA_R + 18 * (g.t / SURVIVE_SEC);
+  const auraDps = AURA_DPS * (1 + g.t / SURVIVE_SEC);
+  for (const e of g.enemies) {
+    if (Math.hypot(e.x - auraP.x, e.y - auraP.y) < auraR + e.r) {
+      e.hp -= auraDps * dt;
+    }
+  }
+  if (g.enemies.some(e => e.hp <= 0)) {
+    const alive = [];
+    for (const e of g.enemies) {
+      if (e.hp <= 0) {
+        g.kills++;
+        burst(g, e.x, e.y, e.col, 8, 150);
+      } else {
+        alive.push(e);
+      }
+    }
+    g.enemies = alive;
+  }
+
+  // ---- 粒子与飘字 ----
+  for (const p of g.particles) { p.x += p.vx*dt; p.y += p.vy*dt; p.vx*=0.92; p.vy*=0.92; p.life-=dt; }
+  g.particles = g.particles.filter(p => p.life > 0);
+  for (const f of g.floats) { f.y -= 30*dt; f.life -= dt; }
+  g.floats = g.floats.filter(f => f.life > 0);
+
+  // ---- 结束 ----
+  if (g.p1.hp <= 0 || (g.dual && g.p2.hp <= 0)) { g.over = true; g.won = false; }
+  if (g.t >= SURVIVE_SEC) { g.over = true; g.won = true; }
+}
+
+function burst(g, x, y, col, n, spd) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = spd * (0.35 + Math.random() * 0.65);
+    g.particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s,
+                       life: 0.3 + Math.random()*0.4, col, r: 1.5 + Math.random()*2 });
+  }
+}
+
+// ---------------------------------------------------------------- 绘制
+let loadingT0 = performance.now();
+function drawLoading() {
+  const s = ((performance.now() - loadingT0) / 1000).toFixed(0);
+  ctx.fillStyle = "#14161b"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = C.text; ctx.font = "bold 26px sans-serif";
+  ctx.fillText("正在准备…", W / 2, H / 2 - 44);
+  ctx.fillStyle = C.dim; ctx.font = "15px sans-serif";
+  ctx.fillText(errEl.textContent || "加载中", W / 2, H / 2);
+  ctx.fillText(`已等待 ${s}s · 首次需要下载约 17 MB 识别资源`, W / 2, H / 2 + 32);
+  ctx.textAlign = "left";
+}
+
+function draw(g) {
+  // 摄像头画面铺底（压暗）—— 一眼看出相机到底有没有工作
+  if (video && video.readyState >= 2) {
+    ctx.save();
+    ctx.globalAlpha = 0.45;
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, -W, 0, W, H);
+    ctx.restore();
+  }
+  ctx.fillStyle = "rgba(20,22,27,0.55)";
+  ctx.fillRect(0, 0, W, H);
+
+  // 网格
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+  for (let x = 0; x <= W; x += 48) {
+    ctx.beginPath(); ctx.moveTo(x, PLAY_T); ctx.lineTo(x, PLAY_B); ctx.stroke();
+  }
+  for (let y = PLAY_T; y <= H; y += 48) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  // 目标环
+  if (g.target) {
+    const rr = TARGET_R + 4 * Math.sin(g.t * 6);
+    ctx.strokeStyle = C.target; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(g.target.x, g.target.y, Math.max(8, rr), 0, 7); ctx.stroke();
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath(); ctx.arc(g.target.x, g.target.y, Math.max(4, rr - 9), 0, 7); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // 敌人
+  for (const e of g.enemies) {
+    ctx.fillStyle = e.col;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = "#14161b"; ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // 粒子
+  for (const p of g.particles) {
+    ctx.globalAlpha = Math.max(0, p.life * 2);
+    ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // 光环范围（贴着受控角色）
+  const ap = g.dual && g.active === 1 ? g.p2 : g.p1;
+  const ar = AURA_R + 18 * (g.t / SURVIVE_SEC);
+  ctx.fillStyle = "rgba(120,170,255,0.06)";
+  ctx.beginPath(); ctx.arc(ap.x, ap.y, ar, 0, 7); ctx.fill();
+  ctx.strokeStyle = "rgba(120,170,255,0.30)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(ap.x, ap.y, ar, 0, 7); ctx.stroke();
+
+  // 角色
+  drawPlayer(g.p1, C.player, g, 0);
+  if (g.dual) drawPlayer(g.p2, C.player2, g, 1);
+
+  // 飘字
+  ctx.font = "bold 14px sans-serif";
+  for (const f of g.floats) {
+    ctx.globalAlpha = Math.min(1, f.life);
+    ctx.fillStyle = f.col;
+    ctx.fillText(f.txt, f.x - 20, f.y);
+  }
+  ctx.globalAlpha = 1;
+
+  drawHud(g);
+  drawHandPip(g);
+
+  // 准备 / 间奏
+  if (g.ctrlPrep > 0) drawCentre(g, `NOW CONTROLLING  ${g.active ? "P2" : "P1"}`,
+                                 Math.ceil(g.ctrlPrep), g.active ? C.player2 : C.player);
+  else if (g.prep > 0) drawCentre(g, "GET READY", Math.ceil(g.prep), C.good);
+  else if (g.over) drawEnd(g);
+}
+
+function drawPlayer(p, col, g, idx) {
+  const R = PLAYER_R;
+  const fx = Math.cos(p.face), fy = Math.sin(p.face);
+  const px = -fy, py = fx;
+  ctx.beginPath();
+  ctx.moveTo(p.x + fx * (R + 7), p.y + fy * (R + 7));
+  ctx.lineTo(p.x - fx * R * 0.75 + px * R, p.y - fy * R * 0.75 + py * R);
+  ctx.lineTo(p.x - fx * R * 0.75 - px * R, p.y - fy * R * 0.75 - py * R);
+  ctx.closePath();
+  ctx.fillStyle = col; ctx.fill();
+  ctx.strokeStyle = "#fcfcfc"; ctx.lineWidth = 2; ctx.stroke();
+
+  if (g.dual && g.active === idx) {
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, R + 15 + 2 * Math.sin(g.t * 5), 0, 7); ctx.stroke();
+    ctx.fillStyle = col; ctx.font = "bold 12px sans-serif";
+    ctx.fillText("YOU", p.x - 14, p.y - R - 22);
+  }
+  if (p.inv > 0) {
+    ctx.strokeStyle = "rgba(200,240,255,0.9)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(p.x, p.y, R + 12, 0, 7); ctx.stroke();
+  }
+
+  // 手该往哪动的提示
+  if (g.hintOn && g.target && (!g.dual || g.active === idx)) {
+    let dx = g.target.x - p.x, dy = g.target.y - p.y;
+    const n = Math.hypot(dx, dy) || 1;
+    dx /= n; dy /= n;
+    if (g.reverse) { dx = -dx; dy = -dy; }
+    ctx.strokeStyle = C.target; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x + dx * 42, p.y + dy * 42); ctx.stroke();
+    const ah = 8;
+    ctx.beginPath();
+    ctx.moveTo(p.x + dx*42, p.y + dy*42);
+    ctx.lineTo(p.x + dx*42 - dy*ah - dx*ah, p.y + dy*42 + dx*ah - dy*ah);
+    ctx.lineTo(p.x + dx*42 + dy*ah - dx*ah, p.y + dy*42 - dx*ah - dy*ah);
+    ctx.closePath(); ctx.fillStyle = C.target; ctx.fill();
+  }
+}
+
+function drawHud(g) {
+  ctx.fillStyle = "#20232b"; ctx.fillRect(0, 0, W, HUD);
+
+  // HP
+  const hpFrac = Math.max(0, g.p1.hp / 120);
+  ctx.fillStyle = "#30343c"; ctx.fillRect(14, 12, 220, 18);
+  ctx.fillStyle = hpFrac > 0.5 ? "#5ac86e" : (hpFrac > 0.25 ? "#46b4dc" : "#505aeb");
+  ctx.fillRect(14, 12, 220 * hpFrac, 18);
+  ctx.fillStyle = "#f5f5f5"; ctx.font = "bold 13px sans-serif";
+  ctx.fillText("HP " + Math.ceil(g.p1.hp), 20, 25);
+
+  if (g.dual) {
+    const f2 = Math.max(0, g.p2.hp / 120);
+    ctx.fillStyle = "#30343c"; ctx.fillRect(14, 33, 220, 8);
+    ctx.fillStyle = C.player2; ctx.fillRect(14, 33, 220 * f2, 8);
+  }
+
+  // 时间 / 击杀 / 分数
+  const left = Math.max(0, SURVIVE_SEC - g.t);
+  ctx.fillStyle = C.text; ctx.font = "bold 22px sans-serif";
+  ctx.fillText(left.toFixed(1) + "s", 500, 31);
+  ctx.font = "13px sans-serif"; ctx.fillStyle = C.dim;
+  ctx.fillText("HIT " + g.hits + "/" + g.spawned, 560, 30);
+  ctx.fillText("KILL " + g.kills, 700, 30);
+  const avg = g.hitTimes.length
+    ? (g.hitTimes.reduce((a,b)=>a+b,0) / g.hitTimes.length).toFixed(1) : "0.0";
+  ctx.fillText("AVG " + avg + "s", 830, 30);
+
+  // 模式与指标
+  const col = g.reverse ? C.warn : C.good;
+  ctx.fillStyle = col; ctx.font = "bold 17px sans-serif";
+  ctx.fillText(g.reverse ? "REVERSE" : "NORMAL", 16, PLAY_T + 32);
+  ctx.font = "12px sans-serif"; ctx.fillStyle = col;
+  ctx.fillText(g.reverse ? "hand -> opposite" : "hand -> same", 16, PLAY_T + 50);
+  if (g.calibrating) {
+    ctx.fillStyle = C.target; ctx.font = "12px sans-serif";
+    ctx.fillText("CALIBRATING - move your hand to all corners", 16, PLAY_T + 68);
+  }
+  if (g.warn) {
+    ctx.fillStyle = C.warn; ctx.font = "bold 13px sans-serif";
+    ctx.fillText("SWITCHING", 16, PLAY_T + 86);
+  }
+  if (g.dual) {
+    ctx.fillStyle = g.active ? C.player2 : C.player;
+    ctx.font = "13px sans-serif";
+    ctx.fillText(`CTRL ${g.active ? "P2" : "P1"}  ${(CTRL_SWITCH - g.ctrlT).toFixed(1)}s`,
+                 16, PLAY_T + 106);
+  }
+
+  // 抑制失败
+  ctx.fillStyle = C.target; ctx.font = "13px sans-serif";
+  ctx.fillText(`switch-err ${g.switchErr}`, 16, PLAY_B - 32);
+
+  // 底部操作
+  ctx.fillStyle = "#585c64"; ctx.font = "12px sans-serif";
+  ctx.fillText("Z recenter   P pause   H hint   R restart", W - 330, H - 10);
+
+  drawDiag();
+}
+
+let diagForced = false;
+
+function drawDiag() {
+  // 认出 6 秒后自动收起；玩家按 D 可以随时叫回来
+  if (stat.stableT > 6 && !diagForced) return;
+  const camOk = video && video.readyState >= 2;
+  const vw = video ? video.videoWidth : 0;
+  const vh = video ? video.videoHeight : 0;
+  const noHand = stat.det > 60 && stat.raw === 0;
+  const col = stat.lastErr ? "#e06a4a" : (noHand ? "#f0a050" : "#7c828c");
+
+  const bw = 640, bh = 58, bx = (W - bw) / 2, by = PLAY_T + 8;
+  ctx.fillStyle = "rgba(16,18,22,0.86)";
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = col; ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, bw, bh);
+
+  ctx.fillStyle = col; ctx.font = "bold 15px monospace";
+  ctx.fillText(`fps ${stat.fps.toFixed(0)}   hands ${hands.length}   det ${stat.det}   raw ${stat.raw}`,
+               bx + 14, by + 24);
+  ctx.font = "13px monospace";
+  ctx.fillStyle = "#5c616a";
+  ctx.fillText(`cam ${camOk ? "ok" : "no"} ${vw}x${vh}   model ${stat.model}   cdn ${CDN_BASE ? CDN_BASE.split("/")[2] : "-"}`,
+               bx + 14, by + 46);
+
+  if (stat.lastErr) {
+    ctx.fillStyle = "#e06a4a"; ctx.font = "12px monospace";
+    ctx.fillText("ERR " + stat.lastErr, bx + 14, by + bh + 16);
+  } else if (noHand) {
+    ctx.fillStyle = "#f0a050"; ctx.font = "bold 14px sans-serif";
+    ctx.fillText("相机正常，但模型找不到手 —— 请把手移到画面中央、离镜头 40~60cm、掌心朝前",
+                 bx + 14, by + bh + 18);
+  }
+}
+
+
+function drawHandPip(g) {
+  const pw = 176, ph = 132;
+  const x0 = W - pw - 12, y0 = PLAY_B - ph - 44;
+  ctx.fillStyle = "#1a1c22"; ctx.fillRect(x0, y0, pw, ph);
+  ctx.strokeStyle = "#444a56"; ctx.lineWidth = 1; ctx.strokeRect(x0, y0, pw, ph);
+
+  if (g.reach.cx !== null) {
+    const bx0 = x0 + clamp(g.reach.cx - JOY_HALF, 0, 1) * pw;
+    const bx1 = x0 + clamp(g.reach.cx + JOY_HALF, 0, 1) * pw;
+    const by0 = y0 + clamp(g.reach.cy - JOY_HALF, 0, 1) * ph;
+    const by1 = y0 + clamp(g.reach.cy + JOY_HALF, 0, 1) * ph;
+    ctx.strokeStyle = "#38586c"; ctx.strokeRect(bx0, by0, bx1 - bx0, by1 - by0);
+    ctx.fillStyle = "#50788c";
+    ctx.beginPath();
+    ctx.arc(x0 + g.reach.cx * pw, y0 + g.reach.cy * ph, 3, 0, 7); ctx.fill();
+  }
+
+  const h = hands[0];
+  if (!h) {
+    ctx.fillStyle = C.warn; ctx.font = "bold 15px sans-serif";
+    ctx.fillText("NO HAND", x0 + 44, y0 + ph / 2);
+    if (stat.det > 20 && stat.raw === 0) {
+      ctx.font = "10px sans-serif"; ctx.fillStyle = "#8a8f98";
+      ctx.fillText("detect ran, 0 found", x0 + 8, y0 + ph / 2 + 18);
+      ctx.fillText("closer / brighter / show palm", x0 + 8, y0 + ph / 2 + 32);
+    }
+    return;
+  }
+  ctx.strokeStyle = "#5ad2a0"; ctx.lineWidth = 1;
+  for (const [a, b] of HAND_EDGES) {
+    ctx.beginPath();
+    ctx.moveTo(x0 + h.pts[a].x * pw, y0 + h.pts[a].y * ph);
+    ctx.lineTo(x0 + h.pts[b].x * pw, y0 + h.pts[b].y * ph);
+    ctx.stroke();
+  }
+  ctx.fillStyle = "#f0f8ff";
+  for (const p of h.pts) {
+    ctx.beginPath(); ctx.arc(x0 + p.x * pw, y0 + p.y * ph, 2, 0, 7); ctx.fill();
+  }
+  ctx.fillStyle = "#fff0a0";
+  ctx.beginPath(); ctx.arc(x0 + h.palm.x * pw, y0 + h.palm.y * ph, 5, 0, 7); ctx.fill();
+  ctx.fillStyle = C.good; ctx.font = "12px sans-serif";
+  ctx.fillText("HAND x" + hands.length, x0 + 5, y0 + 14);
+}
+
+function drawCentre(g, title, num, col) {
+  ctx.fillStyle = "rgba(16,18,22,0.90)"; ctx.fillRect(0, PLAY_T, W, H - PLAY_T);
+  ctx.textAlign = "center";
+  ctx.fillStyle = col; ctx.font = "bold 30px sans-serif";
+  ctx.fillText(title, W / 2, PLAY_T + PH / 2 - 70);
+  ctx.fillStyle = C.text; ctx.font = "bold 72px sans-serif";
+  ctx.fillText(String(num), W / 2, PLAY_T + PH / 2 + 30);
+  ctx.fillStyle = C.dim; ctx.font = "14px sans-serif";
+  ctx.fillText("move your hand around so it can learn your range", W / 2, PLAY_T + PH / 2 + 90);
+  ctx.fillText("space to skip", W / 2, PLAY_T + PH / 2 + 116);
+  ctx.textAlign = "left";
+}
+
+function drawEnd(g) {
+  ctx.fillStyle = "rgba(16,18,22,0.92)";
+  ctx.fillRect(0, PLAY_T + PH / 2 - 90, W, 180);
+  ctx.textAlign = "center";
+  ctx.fillStyle = g.won ? C.good : "#e05a5a";
+  ctx.font = "bold 34px sans-serif";
+  ctx.fillText(g.won ? "SURVIVED" : "YOU DIED", W / 2, PLAY_T + PH / 2 - 20);
+  const avg = g.hitTimes.length
+    ? (g.hitTimes.reduce((a,b)=>a+b,0) / g.hitTimes.length).toFixed(1) : "0.0";
+  ctx.fillStyle = C.dim; ctx.font = "15px sans-serif";
+  ctx.fillText(`target ${g.hits}/${g.spawned}   avg ${avg}s   switch-err ${g.switchErr}   kill ${g.kills}`,
+               W / 2, PLAY_T + PH / 2 + 18);
+  ctx.fillText("press R to restart", W / 2, PLAY_T + PH / 2 + 50);
+  ctx.textAlign = "left";
+}
+
+// ---------------------------------------------------------------- 主循环
+let prev = performance.now();
+const stat = { fps: 0, frames: 0, t0: performance.now(), model: "loading",
+               cam: "no", lastErr: "", det: 0, raw: 0, stableT: 0 };
+
+function loop(now) {
+  const dt = Math.min((now - prev) / 1000, 0.05);
+  prev = now;
+  stat.frames++;
+  if (now - stat.t0 > 500) {
+    stat.fps = stat.frames * 1000 / (now - stat.t0);
+    stat.frames = 0; stat.t0 = now;
+  }
+  try {
+    readHands(now);
+    stat.lastErr = "";
+  } catch (e) {
+    stat.lastErr = String(e && e.message || e).slice(0, 60);
+  }
+  // 连续认出 6 秒后，诊断面板自动隐藏（按 D 可随时叫回来）
+  if (hands.length > 0) stat.stableT += dt;
+  else stat.stableT = 0;
+
+  if (G) {
+    update(G, dt);
+    draw(G);
+  }
+  bindRotateHint();
+  requestAnimationFrame(loop);
+}
+
+// ---------------------------------------------------------------- 交互
+let pendingDual = null;
+
+function start(dual) {
+  overlay.classList.add("hidden");
+  goLandscape();
+  if (stat.model !== "ok" || !video) { pendingDual = dual; return; }
+  G = newGame(dual);
+}
+
+document.getElementById("startSingle").addEventListener("click", () => start(false));
+document.getElementById("startDual").addEventListener("click", () => start(true));
+
+window.addEventListener("keydown", (e) => {
+  if (!G) return;
+  const k = e.key.toLowerCase();
+  if (k === "z" || e.code === "Space") {
+    if (G.prep > 0) { G.prep = 0; return; }
+    if (G.ctrlPrep > 0) { G.ctrlPrep = 0; return; }
+    const h = hands[0];
+    if (h) { G.reach.cx = h.palm.x; G.reach.cy = h.palm.y; }
+    return;
+  }
+  if (k === "h") { G.hintOn = !G.hintOn; return; }
+  if (k === "d") { diagForced = !diagForced; return; }
+  if (k === "r" && G.over) { G = newGame(G.dual); return; }
+});
+
+// ---------------------------------------------------------------- 启动
+function fail(msg) {
+  stat.model = "fail";
+  errEl.textContent = msg;
+  overlay.classList.remove("hidden");
+  document.getElementById("startSingle").disabled = true;
+  document.getElementById("startDual").disabled = true;
+}
+
+(async () => {
+  try {
+    errEl.textContent = "正在加载 MediaPipe 库…";
+    await loadLib();
+    errEl.textContent = "正在加载识别模型（首次约 10 MB，需要联网）…";
+    await initTracking();
+    stat.model = "ok";
+    errEl.textContent = "正在请求摄像头权限…";
+    await initCamera();
+    stat.cam = "ok";
+    errEl.textContent = "";
+    if (pendingDual !== null) { G = newGame(pendingDual); pendingDual = null; }
+  } catch (err) {
+    fail("启动失败：" + (err && err.message ? err.message : err) +
+      "　—　请确认：① 已允许摄像头权限；② 页面通过 https 或 localhost 打开；③ 首次加载需要联网。");
+    return;
+  }
+})();
+
+// 立刻开始渲染：模型还没加载完也要显示进度，绝不能黑屏
+requestAnimationFrame(loop);
+bindRotateHint();
+
+// 竖屏提示：闪一下就走，不挡住开始；点屏幕可立刻关掉
+// 打开时提示一次「横过来」，3.5 秒自动消失。不做任何方向检测。
+let rotTimer = null;
+function showToast(msg, ms) {
+  const el = document.getElementById("toast");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(rotTimer);
+  rotTimer = setTimeout(() => el.classList.remove("show"), ms || 3500);
+}
+function bindRotateHint() {
+  setTimeout(() => showToast("请把手机横过来 · 建议架起来，人退后 60~80cm", 3500), 500);
+}
+</script>
+</body>
+</html>
